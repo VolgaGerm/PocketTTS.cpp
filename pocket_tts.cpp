@@ -962,25 +962,33 @@ public:
         rng::seed(uint64_t(std::chrono::high_resolution_clock::now().time_since_epoch().count()));
         tok_ = std::make_unique<Tokenizer>(cfg_.tokenizer_path);
         
+        // Thread budget: --threads sets the total. During pipelined streaming,
+        // the AR generator and Mimi decoder run simultaneously, so we split the
+        // budget between them. Non-pipelined models (encoder, text conditioner)
+        // get the full budget since they run alone.
         int cores = std::max(1, int(std::thread::hardware_concurrency()));
-        int threads_parallel = cfg_.num_threads ? cfg_.num_threads : std::max(1, cores / 2);
-        // AR models: small sequential matmuls, fewer threads avoids contention
-        int threads_ar = std::min(threads_parallel, 4);
+        int total = cfg_.num_threads ? cfg_.num_threads : std::max(2, cores / 2);
+        int threads_ar = std::min(std::max(1, total / 3), 4);
+        int threads_dec = std::max(1, total - threads_ar);
+        int threads_full = total;
         
-        Ort::SessionOptions opts_parallel;
-        opts_parallel.SetIntraOpNumThreads(threads_parallel);
-        opts_parallel.SetInterOpNumThreads(1);
-        opts_parallel.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+        auto make_opts = [](int threads) {
+            Ort::SessionOptions opts;
+            opts.SetIntraOpNumThreads(threads);
+            opts.SetInterOpNumThreads(1);
+            opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+            return opts;
+        };
         
-        Ort::SessionOptions opts_ar;
-        opts_ar.SetIntraOpNumThreads(threads_ar);
-        opts_ar.SetInterOpNumThreads(1);
-        opts_ar.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+        auto opts_full = make_opts(threads_full);
+        auto opts_ar = make_opts(threads_ar);
+        auto opts_dec = make_opts(threads_dec);
         
         if (cfg_.verbose) {
             std::cout << "\n========== ONNX RUNTIME INFO ==========\n";
             std::cout << "  ORT Version: " << OrtGetApiBase()->GetVersionString() << "\n";
-            std::cout << "  Threads (parallel): " << threads_parallel << ", (autoregressive): " << threads_ar << "\n";
+            std::cout << "  Thread budget: " << total << " (AR: " << threads_ar 
+                      << ", decoder: " << threads_dec << ", full: " << threads_full << ")\n";
             auto providers = Ort::GetAvailableProviders();
             std::cout << "  Execution Providers: ";
             for (size_t i = 0; i < providers.size(); ++i) {
@@ -993,11 +1001,11 @@ public:
         auto& env = get_ort_env();
         std::string sfx = cfg_.precision == "int8" ? "_int8" : "";
         
-        enc_ = std::make_unique<OrtSession>(env, cfg_.models_dir + "/mimi_encoder.onnx", opts_parallel, "mimi_encoder");
-        txt_ = std::make_unique<OrtSession>(env, cfg_.models_dir + "/text_conditioner.onnx", opts_parallel, "text_conditioner");
+        enc_ = std::make_unique<OrtSession>(env, cfg_.models_dir + "/mimi_encoder.onnx", opts_full, "mimi_encoder");
+        txt_ = std::make_unique<OrtSession>(env, cfg_.models_dir + "/text_conditioner.onnx", opts_full, "text_conditioner");
         main_ = std::make_unique<OrtSession>(env, cfg_.models_dir + "/flow_lm_main" + sfx + ".onnx", opts_ar, "flow_lm_main" + sfx);
         flow_ = std::make_unique<OrtSession>(env, cfg_.models_dir + "/flow_lm_flow" + sfx + ".onnx", opts_ar, "flow_lm_flow" + sfx);
-        dec_ = std::make_unique<OrtSession>(env, cfg_.models_dir + "/mimi_decoder" + sfx + ".onnx", opts_parallel, "mimi_decoder" + sfx);
+        dec_ = std::make_unique<OrtSession>(env, cfg_.models_dir + "/mimi_decoder" + sfx + ".onnx", opts_dec, "mimi_decoder" + sfx);
         
         main_runner_ = std::make_unique<StatefulRunner>(*main_);
         
@@ -1496,50 +1504,78 @@ void PocketTTS::stream(const std::string& text, const Tensor& voice, StreamCallb
     
     for (size_t si = 0; si < sentences.size(); ++si) {
         auto gen = make_gen(voice, tokenize(sentences[si]), max_frames);
-        
         StatefulRunner dec_runner(*dec_);
         
-        std::vector<Tensor> buf;
-        int decoded = 0;
+        // Pipelined: generator thread produces latent frames into a queue,
+        // decoder (main thread) consumes them in chunks. The two ONNX sessions
+        // (flow_lm_main and mimi_decoder) run on separate threads simultaneously.
+        
+        std::mutex mtx;
+        std::condition_variable cv;
+        std::deque<Tensor> queue;
+        bool gen_done = false;
+        bool aborted = false;
+        
+        std::thread gen_thread([&]() {
+            while (gen.has_next()) {
+                {
+                    std::lock_guard<std::mutex> lock(mtx);
+                    if (aborted) return;
+                }
+                auto f = gen.next();
+                if (f.numel() == 0) break;
+                {
+                    std::lock_guard<std::mutex> lock(mtx);
+                    queue.push_back(std::move(f));
+                }
+                cv.notify_one();
+            }
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                gen_done = true;
+            }
+            cv.notify_one();
+        });
+        
         bool first = true;
         
-        auto decode_chunk = [&](int sz) {
-            std::vector<Tensor> chunk;
-            for (int i = 0; i < sz && decoded + i < int(buf.size()); ++i)
-                chunk.push_back(buf[decoded + i]);
-            if (chunk.empty()) return true;
+        while (true) {
+            int want = first ? cfg_.first_chunk_frames : cfg_.max_chunk_frames;
             
-            auto lat = Tensor::concat(chunk, 1);
+            std::vector<Tensor> batch;
+            {
+                std::unique_lock<std::mutex> lock(mtx);
+                cv.wait(lock, [&]{ return (int)queue.size() >= want || gen_done; });
+                
+                int take = gen_done ? (int)queue.size() : std::min((int)queue.size(), want);
+                for (int i = 0; i < take; ++i) {
+                    batch.push_back(std::move(queue.front()));
+                    queue.pop_front();
+                }
+            }
+            
+            if (batch.empty()) break;
+            
+            auto lat = Tensor::concat(batch, 1);
             std::vector<Ort::Value> inputs;
-            inputs.push_back(Ort::Value::CreateTensor<float>(dec_runner.mem(), lat.ptr(), lat.numel(), 
+            inputs.push_back(Ort::Value::CreateTensor<float>(dec_runner.mem(), lat.ptr(), lat.numel(),
                                                               lat.shape.data(), lat.shape.size()));
             
             auto outputs = dec_runner.run(inputs);
             auto shape = outputs[0].GetTensorTypeAndShapeInfo().GetShape();
             size_t n = 1;
             for (auto d : shape) n *= d;
-            bool ok = cb(outputs[0].GetTensorData<float>(), n);
-            decoded += int(chunk.size());
-            return ok;
-        };
-        
-        while (gen.has_next()) {
-            auto f = gen.next();
-            if (f.numel() == 0) break;
-            buf.push_back(std::move(f));
             
-            int pending = int(buf.size()) - decoded;
-            int chunk = 0;
-            if (first && pending >= cfg_.first_chunk_frames) {
-                chunk = cfg_.first_chunk_frames;
-                first = false;
-            } else if (!first && pending >= cfg_.max_chunk_frames) {
-                chunk = cfg_.max_chunk_frames;
+            if (!cb(outputs[0].GetTensorData<float>(), n)) {
+                std::lock_guard<std::mutex> lock(mtx);
+                aborted = true;
+                break;
             }
-            if (chunk && !decode_chunk(chunk)) return;
+            first = false;
         }
-        while (decoded < int(buf.size()))
-            if (!decode_chunk(int(buf.size()) - decoded)) return;
+        
+        gen_thread.join();
+        if (aborted) return;
     }
 }
 
@@ -1978,7 +2014,7 @@ int main(int argc, char* argv[]) {
                 "  --precision <int8|fp32>  Model precision (default: int8)\n"
                 "  --temperature <float>    Sampling temperature (default: 0.7)\n"
                 "  --lsd-steps <int>        Flow matching steps (default: 1)\n"
-                "  --threads <int>          Number of threads (default: 0 = half cores)\n"
+                "  --threads <int>          Total thread budget (default: 0 = half cores)\n"
                 "  --models-dir <path>      ONNX models directory (default: models)\n"
                 "  --voices-dir <path>      Voice samples directory (default: voices)\n"
                 "  --tokenizer <path>       Tokenizer path (default: models/tokenizer.model)\n"
@@ -2030,7 +2066,7 @@ int main(int argc, char* argv[]) {
     }
     
     try {
-        int threads = cfg.num_threads ? cfg.num_threads : std::max(1, int(std::thread::hardware_concurrency()) / 2);
+        int threads = cfg.num_threads ? cfg.num_threads : std::max(2, int(std::thread::hardware_concurrency()) / 2);
         
         if (!stdout_output) {
             std::cerr << "Loading (precision=" << cfg.precision << ", threads=" << threads << ")...\n";

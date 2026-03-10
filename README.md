@@ -8,7 +8,7 @@ One file (`pocket_tts.cpp`), no frameworks, no Python dependency at runtime.
 
 - **Single-file implementation** — all inference logic in one C++ source file
 - **CLI, HTTP server, and shared library** — built from the same source
-- **Streaming output** — chunked audio generation with low first-chunk latency (~96ms)
+- **Pipelined streaming** — latent generation and audio decoding run in parallel for low latency (~96ms first chunk)
 - **Voice cloning** — clone any voice from a short WAV sample
 - **Two-layer disk cache** — voice embeddings (`.emb`) and transformer KV state (`.kv`) are cached to disk, making repeated use of the same voice near-instant
 - **INT8 / FP32 precision** — INT8 by default for ~4x smaller models at comparable quality
@@ -137,7 +137,7 @@ To disable caching entirely, pass `--no-cache`.
 | `--precision` | `int8` | Model precision (`int8` or `fp32`) |
 | `--temperature` | `0.7` | Sampling temperature |
 | `--lsd-steps` | `1` | Flow matching ODE solver steps |
-| `--threads` | `0` | Thread count (`0` = half of available cores) |
+| `--threads` | `0` | Total thread budget (`0` = half of available cores) |
 | `--models-dir` | `models` | Path to ONNX model directory |
 | `--voices-dir` | `voices` | Path to voice samples directory |
 | `--no-cache` | — | Disable all disk caching (`.emb` and `.kv` files) |
