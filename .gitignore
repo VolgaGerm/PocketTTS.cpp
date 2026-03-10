@@ -1,0 +1,35 @@
+# Build artifacts
+.build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Compiled binaries
+pocket-tts
+*.so
+*.so.*
+*.dylib
+*.dll
+*.lib
+*.exe
+
+# ONNX models (too large for git — download from HuggingFace)
+models/*.onnx
+
+# Tokenizer model (bundled with ONNX models)
+models/tokenizer.model
+
+# Voice samples
+voices/
+
+# Voice embedding cache
+.cache/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
