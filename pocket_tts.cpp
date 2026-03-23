@@ -1734,6 +1734,7 @@ void PocketTTS::stream(const std::string& text, const Tensor& voice, StreamCallb
                 if (f.numel() == 0) break;
                 {
                     std::lock_guard<std::mutex> lock(mtx);
+                    if (aborted) return;
                     queue.push_back(std::move(f));
                 }
                 cv.notify_one();
@@ -1753,7 +1754,8 @@ void PocketTTS::stream(const std::string& text, const Tensor& voice, StreamCallb
             std::vector<Tensor> batch;
             {
                 std::unique_lock<std::mutex> lock(mtx);
-                cv.wait(lock, [&]{ return (int)queue.size() >= want || gen_done; });
+                cv.wait(lock, [&]{ return (int)queue.size() >= want || gen_done || aborted; });
+                if (aborted) break;
                 
                 int take = gen_done ? (int)queue.size() : std::min((int)queue.size(), want);
                 for (int i = 0; i < take; ++i) {
@@ -1762,27 +1764,31 @@ void PocketTTS::stream(const std::string& text, const Tensor& voice, StreamCallb
                 }
             }
             
-            if (batch.empty()) break;
+            if (batch.empty() && gen_done) break;
             
-            auto lat = Tensor::concat(batch, 1);
-            std::vector<Ort::Value> inputs;
-            inputs.push_back(Ort::Value::CreateTensor<float>(dec_runner_->mem(), lat.ptr(), lat.numel(),
-                                                              lat.shape.data(), lat.shape.size()));
-            
-            auto outputs = dec_runner_->run(inputs);
-            auto shape = outputs[0].GetTensorTypeAndShapeInfo().GetShape();
-            size_t n = 1;
-            for (auto d : shape) n *= d;
-            
-            if (!cb(outputs[0].GetTensorData<float>(), n)) {
-                std::lock_guard<std::mutex> lock(mtx);
-                aborted = true;
-                break;
+            if (!batch.empty()) {
+                auto lat = Tensor::concat(batch, 1);
+                std::vector<Ort::Value> inputs;
+                inputs.push_back(Ort::Value::CreateTensor<float>(dec_runner_->mem(), lat.ptr(), lat.numel(),
+                                                                  lat.shape.data(), lat.shape.size()));
+                
+                auto outputs = dec_runner_->run(inputs);
+                auto shape = outputs[0].GetTensorTypeAndShapeInfo().GetShape();
+                size_t n = 1;
+                for (auto d : shape) n *= d;
+                
+                if (!cb(outputs[0].GetTensorData<float>(), n)) {
+                    std::lock_guard<std::mutex> lock(mtx);
+                    aborted = true;
+                    break;
+                }
+                first = false;
             }
-            first = false;
         }
         
-        gen_thread.join();
+        if (gen_thread.joinable()) {
+            gen_thread.join();
+        }
         if (aborted) return;
     }
 }
@@ -1874,6 +1880,60 @@ static std::string json_get_string(const std::string& json, const std::string& k
             else if (next == 't')  result += '\t';
             else if (next == 'b')  result += '\b';
             else if (next == 'f')  result += '\f';
+            else if (next == 'u' && i + 5 < json.size()) {
+                // \uXXXX — decode as UTF-8
+                unsigned cp = 0;
+                bool ok = true;
+                for (int k = 0; k < 4; ++k) {
+                    char h = json[i + 2 + k];
+                    cp <<= 4;
+                    if      (h >= '0' && h <= '9') cp |= (h - '0');
+                    else if (h >= 'a' && h <= 'f') cp |= (h - 'a' + 10);
+                    else if (h >= 'A' && h <= 'F') cp |= (h - 'A' + 10);
+                    else { ok = false; break; }
+                }
+                if (ok) {
+                    int extra_skip = 4; // skip past uXXXX (++i covers backslash, for-loop covers next)
+                    // Handle surrogate pairs (\uD800-\uDBFF followed by \uDC00-\uDFFF)
+                    if (cp >= 0xD800 && cp <= 0xDBFF && i + 11 < json.size() &&
+                        json[i + 6] == '\\' && json[i + 7] == 'u') {
+                        unsigned lo = 0;
+                        bool ok2 = true;
+                        for (int k = 0; k < 4; ++k) {
+                            char h = json[i + 8 + k];
+                            lo <<= 4;
+                            if      (h >= '0' && h <= '9') lo |= (h - '0');
+                            else if (h >= 'a' && h <= 'f') lo |= (h - 'a' + 10);
+                            else if (h >= 'A' && h <= 'F') lo |= (h - 'A' + 10);
+                            else { ok2 = false; break; }
+                        }
+                        if (ok2 && lo >= 0xDC00 && lo <= 0xDFFF) {
+                            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                            extra_skip = 10; // skip past uXXXX\uYYYY
+                        }
+                        // else: malformed surrogate, encode high surrogate as-is
+                    }
+                    // Encode code point as UTF-8
+                    if (cp < 0x80) {
+                        result += (char)cp;
+                    } else if (cp < 0x800) {
+                        result += (char)(0xC0 | (cp >> 6));
+                        result += (char)(0x80 | (cp & 0x3F));
+                    } else if (cp < 0x10000) {
+                        result += (char)(0xE0 | (cp >> 12));
+                        result += (char)(0x80 | ((cp >> 6) & 0x3F));
+                        result += (char)(0x80 | (cp & 0x3F));
+                    } else {
+                        result += (char)(0xF0 | (cp >> 18));
+                        result += (char)(0x80 | ((cp >> 12) & 0x3F));
+                        result += (char)(0x80 | ((cp >> 6) & 0x3F));
+                        result += (char)(0x80 | (cp & 0x3F));
+                    }
+                    i += extra_skip;
+                } else {
+                    result += '\\'; result += next; // malformed, pass through
+                }
+            }
             else { result += '\\'; result += next; }
             ++i;
         } else if (json[i] == '"') {
