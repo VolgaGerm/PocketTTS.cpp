@@ -2289,7 +2289,7 @@ public:
             return false;
         }
         
-        std::cout << "TTS Server listening on http://localhost:" << port_ << "\n";
+        std::cout << "TTS Server listening on http://0.0.0.0:" << port_ << "\n";
         std::cout << "Endpoints:\n";
         std::cout << "  POST /v1/audio/speech - OpenAI-compatible TTS (JSON: {\"input\": \"...\", \"voice\": \"...\"})\n";
         std::cout << "  POST /tts            - Streaming TTS (JSON: {\"text\": \"...\", \"voice\": \"...\"})\n";
