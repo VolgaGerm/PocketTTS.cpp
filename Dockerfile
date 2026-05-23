@@ -22,7 +22,7 @@ RUN python -m pip install --upgrade pip && \
         onnxruntime
 
 RUN mkdir -p /opt/pocket-tts/models && \
-    python export_onnx.py --output-dir /opt/pocket-tts/models --no-validate
+    python export_onnx.py --output-dir /opt/pocket-tts/models --language english_2026-01 --no-validate
 
 
 FROM ${PYTHON_IMAGE} AS builder
