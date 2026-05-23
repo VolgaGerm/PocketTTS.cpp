@@ -1,0 +1,11 @@
+services:
+  pocket-tts-cpp:
+    image: pocket-tts-cpp:latest
+    container_name: pocket-tts-cpp
+    build:
+      context: .
+    volumes:
+      - ./voices:/app/voices
+    ports:
+      - "8080:8080"
+    command: ["--server", "--port", "8080"]

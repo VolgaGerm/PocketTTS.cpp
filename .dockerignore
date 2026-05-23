@@ -1,0 +1,6 @@
+# Keep the Docker build context to only the files copied by Dockerfile.
+*
+
+!export_onnx.py
+!CMakeLists.txt
+!pocket_tts.cpp

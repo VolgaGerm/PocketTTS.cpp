@@ -121,7 +121,7 @@ The `/v1/audio/speech` endpoint is compatible with the OpenAI TTS API. Any clien
 ```bash
 curl -X POST http://localhost:8080/v1/audio/speech \
   -H "Content-Type: application/json" \
-  -d '{"model": "tts-1", "input": "Hello world!", "voice": "voice", "response_format": "wav"}' \
+  -d '{"model": "tts-1", "input": "Hello world!", "voice": "voice.wav", "response_format": "wav"}' \
   --output speech.wav
 ```
 
@@ -143,6 +143,27 @@ void   ptt_destroy(void* handle);
 void*  ptt_stream_start(void* handle, const char* text, const char* voice);
 int    ptt_stream_read(void* stream_ctx, float** out_samples, int* out_len);
 void   ptt_stream_end(void* stream_ctx);
+```
+
+### Docker
+
+This will build and run `pocket-tts-cpp:latest`:
+
+```
+docker compose up --build
+```
+
+After build can also be used like this:
+```
+docker run --rm -it -v ./voices:/app/voices -p 8080:8080 pocket-tts-cpp --server --port 8080
+```
+
+Usage same as before:
+```
+curl -X POST http://localhost:8080/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"model": "tts-1", "input": "Hello world!", "voice": "voice.wav", "response_format": "wav"}' \
+  --output speech.wav
 ```
 
 ## Caching

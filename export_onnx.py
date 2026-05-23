@@ -1198,8 +1198,10 @@ def main():
                         help="Which models to export")
     parser.add_argument("--max-seq", type=int, default=MAX_SEQ_LEN,
                         help=f"Max KV cache length for flow_lm (default: {MAX_SEQ_LEN})")
+    parser.add_argument("--language", default="english_2026-01",
+                        help="Built-in PocketTTS config to use when --config is not set")
     parser.add_argument("--config", default=None,
-                        help="Path to config YAML (default: use built-in b6369a24)")
+                        help="Path to config YAML (overrides --language)")
     parser.add_argument("--validate-only", action="store_true",
                         help="Skip export/quantize, only validate existing ONNX files")
     parser.add_argument("--no-validate", action="store_true",
@@ -1247,13 +1249,16 @@ def main():
         _download(f"{HF_BASE}/tokenizer.model", tokenizer_file)
         print(f"  ✓ {tokenizer_file}")
 
-    # Build config pointing at local weights
+    # Build config pointing at local weights/tokenizer. Upstream renamed the
+    # original b6369a24 English config to english_2026-01 in pocket-tts v2.x.
     import pocket_tts as _ptt
-    config_path = Path(_ptt.__file__).parent / "config" / "b6369a24.yaml"
     if args.config:
         config_path = Path(args.config)
+    else:
+        config_path = Path(_ptt.__file__).parent / "config" / f"{args.language}.yaml"
     config = load_config(config_path)
     config.weights_path = str(weights_file)
+    config.flow_lm.lookup_table.tokenizer_path = str(tokenizer_file)
 
     # Load model with voice cloning weights
     print("Loading model...")
